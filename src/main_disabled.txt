@@ -1,0 +1,376 @@
+#include <Arduino.h>
+#include <WiFi.h>
+#include <ESPAsyncWebServer.h>
+#include <vector>
+#include "config.h"
+
+// ============ DATA STRUCTURES ============
+struct Measurement {
+  unsigned long timestamp;
+  float pressure;
+};
+
+// ============ GLOBAL VARIABLES ============
+AsyncWebServer server(80);
+std::vector<Measurement> measurements;
+SemaphoreHandle_t measurementMutex = NULL;
+
+// ============ FORWARD DECLARATIONS ============
+void sensorTask(void *parameter);
+float readPressure();
+float readRealPressure();
+float simulatePressure();
+void setupWiFi();
+void setupWebServer();
+String generateHTML();
+
+// ============ SETUP ============
+void setup() {
+  Serial.begin(115200);
+  delay(2000);  // Increased delay for serial initialization
+  
+  Serial.println("\n\n=== PneuNet Gripper Sensor System ===");
+  Serial.flush();
+  delay(100);
+  
+  // Create mutex for thread-safe data access
+  Serial.println("Creating mutex...");
+  Serial.flush();
+  measurementMutex = xSemaphoreCreateMutex();
+  delay(100);
+  
+  // Setup ADC
+  Serial.println("Setting up ADC...");
+  Serial.flush();
+  analogReadResolution(12);  // 12-bit ADC (0-4095)
+  Serial.println("Sensor initialized");
+  if (SIMULATE_SENSOR) {
+    Serial.println("SIMULATION MODE ENABLED");
+  } else {
+    Serial.println("Real sensor mode");
+  }
+  Serial.flush();
+  delay(100);
+  
+  // Setup WiFi
+  Serial.println("Setting up WiFi...");
+  Serial.flush();
+  setupWiFi();
+  Serial.println("WiFi setup complete");
+  Serial.flush();
+  delay(500);
+  
+  // Setup Web Server
+  Serial.println("Setting up Web Server...");
+  Serial.flush();
+  setupWebServer();
+  Serial.println("Web Server setup complete");
+  Serial.flush();
+  delay(500);
+  
+  // Create FreeRTOS task for sensor reading
+  Serial.println("Creating sensor task...");
+  Serial.flush();
+  xTaskCreatePinnedToCore(
+    sensorTask,           // Function
+    "SensorTask",         // Name
+    8192,                 // Stack size
+    NULL,                 // Parameter
+    1,                    // Priority
+    NULL,                 // Task handle
+    0                     // Core 0
+  );
+  Serial.println("Sensor task created");
+  Serial.flush();
+  
+  Serial.println("Setup complete!");
+  Serial.printf("Connect to WiFi: %s\n", SSID);
+  Serial.printf("Password: %s\n", PASSWORD);
+  Serial.println("Open browser: http://192.168.4.1");
+}
+
+// ============ MAIN LOOP ============
+void loop() {
+  // Empty loop - server and sensor run on FreeRTOS tasks
+  delay(1000);
+}
+
+// ============ SENSOR READING TASK ============
+void sensorTask(void *parameter) {
+  while (true) {
+    float pressure = readPressure();
+    unsigned long timestamp = millis();
+    
+    // Thread-safe data storage
+    if (xSemaphoreTake(measurementMutex, portMAX_DELAY)) {
+      if (measurements.size() < MAX_MEASUREMENTS) {
+        measurements.push_back({timestamp, pressure});
+      } else {
+        // Remove oldest measurement when buffer full
+        measurements.erase(measurements.begin());
+        measurements.push_back({timestamp, pressure});
+      }
+      xSemaphoreGive(measurementMutex);
+    }
+    
+    Serial.printf("Pressure: %.2f kPa, Time: %lu ms, Count: %zu\n", 
+                  pressure, timestamp, measurements.size());
+    
+    delay(SAMPLING_DELAY);
+  }
+}
+
+// ============ PRESSURE SENSOR READING ============
+float readPressure() {
+  if (SIMULATE_SENSOR) {
+    return simulatePressure();
+  } else {
+    return readRealPressure();
+  }
+}
+
+float readRealPressure() {
+  // Read ADC (averaged over 10 samples for stability)
+  int rawSum = 0;
+  for (int i = 0; i < 10; i++) {
+    rawSum += analogRead(ADC_PIN);
+  }
+  int adcValue = rawSum / 10;
+  
+  // Convert ADC value to voltage (12-bit ADC: 0-4095 maps to 0-3.3V)
+  float Vout = adcValue * (3.3 / 4095.0);
+  
+  // MPX5010 datasheet formula: P(kPa) = (Vout/Vs - 0.04) / 0.09
+  float pressure_kPa = (Vout / Vs - 0.04) / 0.09;
+  
+  // Clamp negative values (sensor noise at zero pressure)
+  if (pressure_kPa < 0) pressure_kPa = 0;
+  
+  return pressure_kPa;
+}
+
+float simulatePressure() {
+  static unsigned long startTime = millis();
+  unsigned long elapsedTime = millis() - startTime;
+  
+  // Create oscillating pattern with noise
+  float time_s = elapsedTime / 1000.0;
+  float oscillation = SIM_AMPLITUDE * sin(2 * PI * SIM_FREQUENCY * time_s);
+  float noise = (random(-100, 100) / 100.0) * SIM_NOISE;
+  float pressure = SIM_BASE_PRESSURE + oscillation + noise;
+  
+  // Clamp to realistic values (0-10 kPa for demonstration)
+  if (pressure < 0) pressure = 0;
+  if (pressure > 10) pressure = 10;
+  
+  return pressure;
+}
+
+// ============ WIFI SETUP ============
+void setupWiFi() {
+  Serial.println("WiFi: Setting mode to AP...");
+  Serial.flush();
+  WiFi.mode(WIFI_AP);
+  delay(100);
+  
+  Serial.println("WiFi: Starting softAP...");
+  Serial.flush();
+  bool result = WiFi.softAP(SSID, PASSWORD);
+  Serial.printf("WiFi: softAP result = %d\n", result);
+  Serial.flush();
+  delay(100);
+  
+  IPAddress IP = WiFi.softAPIP();
+  Serial.print("AP IP address: ");
+  Serial.println(IP);
+  Serial.flush();
+}
+
+// ============ WEB SERVER SETUP ============
+void setupWebServer() {
+  Serial.println("WebServer: Registering routes...");
+  Serial.flush();
+  
+  // Serve main page
+  server.on("/", HTTP_GET, [](AsyncWebServerRequest *request) {
+    request->send(200, "text/html", generateHTML());
+  });
+  Serial.println("WebServer: Route / registered");
+  Serial.flush();
+  
+  // API endpoint: get all measurements as JSON
+  server.on("/api/data", HTTP_GET, [](AsyncWebServerRequest *request) {
+    String json = "[";
+    
+    if (xSemaphoreTake(measurementMutex, portMAX_DELAY)) {
+      for (size_t i = 0; i < measurements.size(); i++) {
+        if (i > 0) json += ",";
+        json += "{\"t\":" + String(measurements[i].timestamp) + 
+                ",\"p\":" + String(measurements[i].pressure, 2) + "}";
+      }
+      xSemaphoreGive(measurementMutex);
+    }
+    
+    json += "]";
+    request->send(200, "application/json", json);
+  });
+  Serial.println("WebServer: Route /api/data registered");
+  Serial.flush();
+  
+  // API endpoint: get latest measurement
+  server.on("/api/latest", HTTP_GET, [](AsyncWebServerRequest *request) {
+    String json = "{}";
+    
+    if (xSemaphoreTake(measurementMutex, portMAX_DELAY)) {
+      if (!measurements.empty()) {
+        Measurement latest = measurements.back();
+        json = "{\"t\":" + String(latest.timestamp) + 
+               ",\"p\":" + String(latest.pressure, 2) + "}";
+      }
+      xSemaphoreGive(measurementMutex);
+    }
+    
+    request->send(200, "application/json", json);
+  });
+  Serial.println("WebServer: Route /api/latest registered");
+  Serial.flush();
+  
+  // API endpoint: clear data
+  server.on("/api/clear", HTTP_GET, [](AsyncWebServerRequest *request) {
+    if (xSemaphoreTake(measurementMutex, portMAX_DELAY)) {
+      measurements.clear();
+      xSemaphoreGive(measurementMutex);
+    }
+    request->send(200, "application/json", "{\"status\":\"cleared\"}");
+  });
+  Serial.println("WebServer: Route /api/clear registered");
+  Serial.flush();
+  
+  // API endpoint: export as CSV
+  server.on("/api/export", HTTP_GET, [](AsyncWebServerRequest *request) {
+    String csv = "Time_ms,Pressure_kPa\n";
+    
+    if (xSemaphoreTake(measurementMutex, portMAX_DELAY)) {
+      for (const auto& m : measurements) {
+        csv += String(m.timestamp) + "," + String(m.pressure, 4) + "\n";
+      }
+      xSemaphoreGive(measurementMutex);
+    }
+    
+    request->send(200, "text/csv", csv);
+  });
+  Serial.println("WebServer: Route /api/export registered");
+  Serial.flush();
+  
+  Serial.println("WebServer: Calling server.begin()...");
+  Serial.flush();
+  server.begin();
+  Serial.println("WebServer: server.begin() completed");
+  Serial.flush();
+}
+
+// ============ HTML GENERATION ============
+String generateHTML() {
+  return R"rawliteral(
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>PneuNet Sensor</title>
+  <style>
+    body { font-family: Arial; background: #f0f0f0; padding: 20px; }
+    .container { max-width: 800px; margin: 0 auto; background: white; padding: 20px; border-radius: 8px; }
+    h1 { color: #333; }
+    .stat { display: inline-block; margin: 10px; padding: 10px; background: #e8f4f8; border-radius: 5px; }
+    .stat-value { font-size: 24px; font-weight: bold; color: #0066cc; }
+    button { padding: 10px 15px; margin: 5px; background: #0066cc; color: white; border: none; border-radius: 5px; cursor: pointer; }
+    button:hover { background: #0052a3; }
+    table { width: 100%; border-collapse: collapse; margin-top: 20px; }
+    th, td { padding: 10px; text-align: left; border-bottom: 1px solid #ddd; }
+    th { background: #f5f5f5; font-weight: bold; }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <h1>PneuNet Sensor Dashboard</h1>
+    <div class="stat">
+      <div>Current Pressure</div>
+      <div class="stat-value"><span id="currentPressure">--</span> kPa</div>
+    </div>
+    <div class="stat">
+      <div>Max Pressure</div>
+      <div class="stat-value"><span id="maxPressure">--</span> kPa</div>
+    </div>
+    <div class="stat">
+      <div>Avg Pressure</div>
+      <div class="stat-value"><span id="avgPressure">--</span> kPa</div>
+    </div>
+    <div class="stat">
+      <div>Count</div>
+      <div class="stat-value"><span id="count">0</span></div>
+    </div>
+    <br>
+    <button onclick="clearData()">Clear Data</button>
+    <button onclick="exportCSV()">Export CSV</button>
+    <button onclick="location.reload()">Refresh</button>
+    
+    <h2>Recent Readings</h2>
+    <table id="dataTable">
+      <thead>
+        <tr><th>Time (ms)</th><th>Pressure (kPa)</th></tr>
+      </thead>
+      <tbody></tbody>
+    </table>
+  </div>
+
+  <script>
+    let allData = [];
+    
+    async function loadData() {
+      try {
+        const response = await fetch('/api/data');
+        allData = await response.json();
+        updateDisplay();
+      } catch(e) { console.error(e); }
+    }
+    
+    function updateDisplay() {
+      const pressures = allData.map(m => m.p);
+      document.getElementById('count').textContent = allData.length;
+      document.getElementById('currentPressure').textContent = allData.length > 0 ? allData[allData.length-1].p.toFixed(2) : '--';
+      document.getElementById('maxPressure').textContent = pressures.length > 0 ? Math.max(...pressures).toFixed(2) : '--';
+      document.getElementById('avgPressure').textContent = pressures.length > 0 ? (pressures.reduce((a,b)=>a+b)/pressures.length).toFixed(2) : '--';
+      
+      const tbody = document.querySelector('#dataTable tbody');
+      tbody.innerHTML = '';
+      const start = Math.max(0, allData.length - 20);
+      for (let i = start; i < allData.length; i++) {
+        const row = tbody.insertRow();
+        row.insertCell(0).textContent = allData[i].t;
+        row.insertCell(1).textContent = allData[i].p.toFixed(4);
+      }
+    }
+    
+    async function clearData() {
+      if(confirm('Clear all data?')) { await fetch('/api/clear'); allData=[]; updateDisplay(); }
+    }
+    
+    async function exportCSV() {
+      const response = await fetch('/api/export');
+      const csv = await response.text();
+      const blob = new Blob([csv], {type: 'text/csv'});
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = 'sensor_data.csv';
+      a.click();
+    }
+    
+    loadData();
+    setInterval(loadData, 1000);
+  </script>
+</body>
+</html>
+)rawliteral";
+}

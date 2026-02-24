@@ -1,0 +1,301 @@
+# Grasping Detection - Component Diagram
+
+## System Architecture
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                     PneuNet Sensor System                        │
+│                                                                   │
+│  ┌──────────────────────────────────────────────────────────┐   │
+│  │  Hardware Layer                                          │   │
+│  │  ┌──────────────────┐  ┌──────────────────────┐         │   │
+│  │  │ Pressure Sensor  │  │ Capacitance Sensor   │         │   │
+│  │  │ (MPX5010 5V)     │  │ (Touch Sensor)       │         │   │
+│  │  └────────┬─────────┘  └──────────┬───────────┘         │   │
+│  └───────────┼─────────────────────────┼──────────────────┘   │
+│              │                         │                       │
+│              ▼                         ▼                       │
+│  ┌──────────────────────────────────────────────────────────┐   │
+│  │  Sensor Tasks (High Priority)                            │   │
+│  │  ┌──────────────────────┐  ┌──────────────────────┐     │   │
+│  │  │ pressureSensorTask   │  │ capacitanceSensorTask │    │   │
+│  │  │ - Reads ADC          │  │ - Measures capacitance   │   │
+│  │  │ - Updates mutex      │  │ - Updates mutex      │     │   │
+│  │  └──────────┬───────────┘  └──────────┬───────────┘     │   │
+│  │             │                         │                  │   │
+│  │      lastPressure              lastCapacitance          │   │
+│  └─────────────┼─────────────────────────┼──────────────────┘   │
+│                │                         │                      │
+│                ▼                         ▼                      │
+│  ┌──────────────────────────────────────────────────────────┐   │
+│  │  Data Processor Task (Medium Priority)                   │   │
+│  │  ┌─────────────────────────────────────────────────┐    │   │
+│  │  │ detectGrasping()                                │    │   │
+│  │  │ ┌──────────────────────────────────────────┐  │    │   │
+│  │  │ │ Check: Pressure increasing?              │  │    │   │
+│  │  │ │        ΔP > PRESSURE_INCREASE_THRESHOLD  │  │    │   │
+│  │  │ │                                          │  │    │   │
+│  │  │ │ Check: Capacitance stable?               │  │    │   │
+│  │  │ │        |ΔC| < CAPACITANCE_TOLERANCE     │  │    │   │
+│  │  │ │                                          │  │    │   │
+│  │  │ │ Result: Grasping = (ΔP > Th) AND (ΔC < Tol)│    │   │
+│  │  │ └──────────────────────────────────────────┘  │    │   │
+│  │  │                                              │    │   │
+│  │  │ State Machine:                              │    │   │
+│  │  │ - Count confirmations (0..N)                │    │   │
+│  │  │ - Track detection window                    │    │   │
+│  │  │ - Set isGrasping flag when confirmed       │    │   │
+│  │  │ - Clear flag when conditions no longer met  │    │   │
+│  │  └─────────────────────────────────────────────┘    │   │
+│  │                          │                          │   │
+│  │                   isGrasping = true/false           │   │
+│  │                          │                          │   │
+│  └──────────────────────────┼──────────────────────────┘   │
+│                             │                               │
+│        ┌────────────────────┼────────────────────┐          │
+│        │                    │                    │          │
+│        ▼                    ▼                    ▼          │
+│  ┌──────────────┐  ┌──────────────┐  ┌──────────────────┐  │
+│  │ Main Loop    │  │ SD Card Log  │  │ Web API Server   │  │
+│  │              │  │              │  │                  │  │
+│  │ if (isGrp)   │  │ Writes:      │  │ /api/grasping    │  │
+│  │  - LED Green │  │ Time,Pressure│  │ Returns:         │  │
+│  │  - Bright    │  │ Capacitance  │  │ {grasping: T/F}  │  │
+│  │ else if(coll)│  │              │  │                  │  │
+│  │  - LED Purple│  │ (every 100ms)│  │ (updated live)   │  │
+│  │ else         │  └──────────────┘  └──────────────────┘  │
+│  │  - LED Blue  │                              │            │
+│  │              │                    ┌─────────┘            │
+│  │ (1s loop)    │                    │                      │
+│  └──────────────┘         ┌──────────┴─────────┐            │
+│                           ▼                    ▼            │
+│                  ┌──────────────────────────────────┐       │
+│                  │  Web Dashboard                   │       │
+│                  │                                  │       │
+│                  │  Status: YES/NO                  │       │
+│                  │  LED: Green (with glow) / Gray   │       │
+│                  │  (Updated every 500ms)           │       │
+│                  │                                  │       │
+│                  │  + Pressure stats                │       │
+│                  │  + Capacitance stats             │       │
+│                  │  + Pressure/Capacitance chart    │       │
+│                  └──────────────────────────────────┘       │
+│                                                              │
+└─────────────────────────────────────────────────────────────┘
+```
+
+## Configuration Parameters Flow
+
+```
+config.h Constants
+    │
+    ├─ PRESSURE_INCREASE_THRESHOLD (0.5 kPa)
+    │  └─ Used in: detectGrasping()
+    │
+    ├─ CAPACITANCE_TOLERANCE (2.0 pF)
+    │  └─ Used in: detectGrasping()
+    │
+    ├─ GRASPING_DETECTION_WINDOW (2000 ms)
+    │  └─ Used in: dataProcessorTask state machine
+    │
+    ├─ GRASPING_CONFIRMATION_COUNT (3)
+    │  └─ Used in: dataProcessorTask state machine
+    │
+    └─ LED_BRIGHTNESS_GRASPING (200)
+       └─ Used in: ledStatusGrasping()
+```
+
+## Data Flow Timeline
+
+```
+Time    Pressure  Capacitance  State               Action
+────────────────────────────────────────────────────────────
+0 ms    0.00      45.23        -                   Start collection
+100 ms  0.15      45.20        Baseline           Monitor
+200 ms  0.50      45.18        Detection count=1  Pressure rising, cap stable
+300 ms  1.20      45.25        Detection count=2  Confirm grasping
+400 ms  1.90      45.19        Detection count=3  ✓ GRASPING DETECTED
+500 ms  2.45      45.18        isGrasping=true    LED → Green (bright)
+600 ms  3.00      45.20        isGrasping=true    Dashboard shows "YES"
+700 ms  2.80      45.25        isGrasping=true    Maintaining grip
+800 ms  2.50      45.23        isGrasping=true    Slight pressure change
+900 ms  1.00      45.20        isGrasping=true    Still grasping
+1000 ms 0.30      45.22        Release detect     Reset detection count
+1100 ms 0.00      45.23        isGrasping=false   ✓ GRASPING RELEASED
+1200 ms 0.00      45.24        Baseline           LED → Blue
+                                                   Dashboard shows "No"
+```
+
+## LED Color States
+
+```
+                    ┌─────────────────────┐
+                    │  Main Loop (1s)     │
+                    └──────────┬──────────┘
+                               │
+                    ┌──────────▼──────────┐
+                    │ if (isGrasping)?    │
+                    └─────┬──────┬────────┘
+                        YES│    │NO
+                          │     │
+                      ┌───▼─┐  │
+                      │GREEN│  │
+                  (Bright)   │
+                    Glow     │
+                        ┌────▼──────────┐
+                        │ if (collecting)?
+                        └─────┬────┬────┘
+                           YES│   │NO
+                             │    │
+                         ┌───▼──┐ │
+                         │PURPLE│ │
+                      (Collecting)│
+                                  │
+                            ┌─────▼──┐
+                            │ BLUE   │
+                         (Idle)
+```
+
+## Message Flow: LED Green on Grasping
+
+```
+┌─────────────────────────────────────────────────────┐
+│ Gripper applies pressure while object is stationary │
+└──────────────────────┬──────────────────────────────┘
+                       │
+                       ▼
+            ┌──────────────────────┐
+            │ pressureSensorTask   │
+            │ Reads: P = 2.5 kPa   │
+            └──────────┬───────────┘
+                       │
+                       ▼
+            ┌──────────────────────────┐
+            │ capacitanceSensorTask    │
+            │ Reads: C = 45.20 pF      │
+            │ (stable, object rigid)   │
+            └──────────┬───────────────┘
+                       │
+                       ▼
+            ┌──────────────────────────────────┐
+            │ dataProcessorTask                │
+            │ detectGrasping(2.5, 45.20)       │
+            │  ΔP = 2.5 - 0.0 = 2.5 > 0.5 ✓  │
+            │  ΔC = |45.20-45.23| = 0.03      │
+            │     < 2.0 ✓                     │
+            │  → Grasping detected!           │
+            │  → Set isGrasping = true        │
+            └──────────┬───────────────────────┘
+                       │
+                       ▼
+            ┌──────────────────────┐
+            │ Main Loop (next 1s)  │
+            │ if (isGrasping)      │
+            │  → ledStatusGrasping()
+            │  → Set RGB: (0,255,0)│
+            │  → Brightness: 200   │
+            └──────────┬───────────┘
+                       │
+                       ▼
+            ┌──────────────────────┐
+            │ LED turns bright     │
+            │ GREEN (#00FF00)      │
+            │ Glow effect on       │
+            └──────────────────────┘
+```
+
+## Web API Sequence
+
+```
+Browser (every 500ms)
+    │
+    ├─ fetch('/api/data')         (Pressure/Capacitance)
+    │       │
+    │       └─> webserver returns JSON
+    │           {t:2500, p:2.45, c:45.18}
+    │       │
+    │       └─> updateStats()
+    │
+    ├─ fetch('/api/grasping')      (Grasping status)
+    │       │
+    │       └─> webserver returns JSON
+    │           {grasping: true}
+    │       │
+    │       └─> updateGraspingStatus()
+    │           │
+    │           ├─ Set text: "YES - GRASPING DETECTED"
+    │           ├─ Set color: green
+    │           ├─ Set font-weight: bold
+    │           └─ LED circle:
+    │               background: #00ff00
+    │               box-shadow: glow
+    │
+    └─ Refresh display
+```
+
+## State Machine: Grasping Detection
+
+```
+START
+  │
+  ▼
+┌────────────────────────┐
+│ Count = 0              │
+│ isGrasping = false     │
+└────────────┬───────────┘
+             │
+             ▼
+    ┌─────────────────┐
+    │ Check condition │
+    └────┬────────┬───┘
+      YES│       │NO
+        │        │
+    ┌───▼──┐  ┌──▼──────────┐
+    │Count │  │ Reset count │
+    │ += 1 │  │ to 0        │
+    └───┬──┘  └────┬────────┘
+        │          │
+        ▼          │
+    ┌────────────────────────────┐
+    │ Count >= Confirmation?     │
+    │ (GRASPING_CONFIRMATION_CNT)│
+    └────┬───────────────┬───────┘
+     YES │               │ NO
+        │               │
+    ┌───▼───────┐  ┌────▼──────────┐
+    │isGrasping │  │ Time window   │
+    │ = true    │  │ expired?      │
+    └───┬───────┘  └────┬────┬─────┘
+        │            YES│   │NO
+        │              │    │
+        ▼       ┌──────▼┐  │
+    ┌─────────────────┐ Reset count
+    │ State: GRASPING │ = 0
+    │ (LED = Green)   │ Loop back
+    └───┬─────────────┘
+        │
+        ▼
+    ┌──────────────────────────┐
+    │ Monitor condition changes│
+    │ (pressure releases or    │
+    │  capacitance changes)    │
+    └─────┬──────────────────┬─┘
+       YES│                 │NO
+        │                  │
+    ┌───▼──────────┐  Loop back
+    │Count = 0     │  (stay grasping)
+    │isGrasping=   │
+    │false         │
+    └───┬──────────┘
+        │
+        ▼
+    ┌──────────────┐
+    │State: IDLE   │
+    │(LED = Blue)  │
+    └──────────────┘
+```
+
+---
+
+*Last Updated: January 31, 2026*
+*Status: ✅ Implementation Complete*
